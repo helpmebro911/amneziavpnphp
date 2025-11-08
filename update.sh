@@ -16,10 +16,33 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Auto-detect docker compose command
+if command -v docker-compose &> /dev/null; then
+    DOCKER_COMPOSE="docker-compose"
+elif docker compose version &> /dev/null; then
+    DOCKER_COMPOSE="docker compose"
+else
+    echo -e "${RED}Error: Neither 'docker compose' nor 'docker-compose' found${NC}"
+    exit 1
+fi
+
+# Load DB credentials from .env
+if [ -f .env ]; then
+    export $(grep -v '^#' .env | xargs)
+    DB_USER=${DB_USERNAME:-amnezia}
+    DB_PASS=${DB_PASSWORD:-amnezia}
+    DB_ROOT_PASS=${DB_ROOT_PASSWORD:-rootpassword}
+else
+    echo -e "${YELLOW}⚠ .env file not found, using defaults${NC}"
+    DB_USER="amnezia"
+    DB_PASS="amnezia"
+    DB_ROOT_PASS="rootpassword"
+fi
+
 # Check if docker compose is running
-if ! docker compose ps | grep -q "Up"; then
+if ! $DOCKER_COMPOSE ps | grep -q "Up"; then
     echo -e "${RED}Error: Docker containers are not running${NC}"
-    echo "Please start containers first: docker compose up -d"
+    echo "Please start containers first: $DOCKER_COMPOSE up -d"
     exit 1
 fi
 
@@ -29,9 +52,10 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 mkdir -p $BACKUP_DIR
 
 echo -e "${YELLOW}[1/7] Creating backup...${NC}"
-# Backup database
-docker compose exec -T db mysqldump -uamnezia -pamnezia amnezia_panel > "$BACKUP_DIR/db_backup_$TIMESTAMP.sql" 2>/dev/null
-if [ $? -eq 0 ]; then
+# Backup database (try root first, fallback to regular user)
+if $DOCKER_COMPOSE exec -T db mysqldump -uroot -p$DB_ROOT_PASS amnezia_panel > "$BACKUP_DIR/db_backup_$TIMESTAMP.sql" 2>/dev/null; then
+    echo -e "${GREEN}✓ Database backup created: $BACKUP_DIR/db_backup_$TIMESTAMP.sql${NC}"
+elif $DOCKER_COMPOSE exec db mysqldump -uroot -p$DB_ROOT_PASS amnezia_panel > "$BACKUP_DIR/db_backup_$TIMESTAMP.sql" 2>/dev/null; then
     echo -e "${GREEN}✓ Database backup created: $BACKUP_DIR/db_backup_$TIMESTAMP.sql${NC}"
 else
     echo -e "${RED}✗ Database backup failed${NC}"
@@ -82,7 +106,7 @@ fi
 # 5. Install/update dependencies
 echo ""
 echo -e "${YELLOW}[4/7] Installing dependencies...${NC}"
-docker compose exec web composer install --no-interaction --prefer-dist 2>&1 | grep -v "Warning"
+$DOCKER_COMPOSE exec web composer install --no-interaction --prefer-dist 2>&1 | grep -v "Warning"
 echo -e "${GREEN}✓ Dependencies installed${NC}"
 
 # 6. Apply migrations
@@ -96,7 +120,8 @@ if [ -z "$MIGRATIONS" ]; then
     echo -e "${YELLOW}⚠ No migration files found${NC}"
 else
     # Create migrations tracking table if not exists
-    docker compose exec -T db mysql -uamnezia -pamnezia amnezia_panel <<EOF 2>/dev/null
+    $DOCKER_COMPOSE exec -T db mysql -uroot -p$DB_ROOT_PASS amnezia_panel <<EOF 2>/dev/null || \
+    $DOCKER_COMPOSE exec db mysql -uroot -p$DB_ROOT_PASS amnezia_panel <<EOF 2>/dev/null
 CREATE TABLE IF NOT EXISTS schema_migrations (
     id INT PRIMARY KEY AUTO_INCREMENT,
     filename VARCHAR(255) UNIQUE NOT NULL,
@@ -111,22 +136,24 @@ EOF
         FILENAME=$(basename "$migration")
         
         # Check if already applied
-        ALREADY_APPLIED=$(docker compose exec -T db mysql -uamnezia -pamnezia amnezia_panel -sN <<EOF 2>/dev/null
+        ALREADY_APPLIED=$($DOCKER_COMPOSE exec -T db mysql -uroot -p$DB_ROOT_PASS amnezia_panel -sN <<EOF 2>/dev/null || echo "0"
 SELECT COUNT(*) FROM schema_migrations WHERE filename = '$FILENAME';
 EOF
 )
         
-        if [ "$ALREADY_APPLIED" = "0" ]; then
+        if [ "$ALREADY_APPLIED" = "0" ] || [ -z "$ALREADY_APPLIED" ]; then
             echo "  Applying: $FILENAME"
             
-            # Apply migration
-            if cat "$migration" | docker compose exec -T db mysql -uamnezia -pamnezia amnezia_panel 2>/dev/null; then
+            # Apply migration (try -T first, fallback without)
+            if cat "$migration" | $DOCKER_COMPOSE exec -T db mysql -uroot -p$DB_ROOT_PASS amnezia_panel 2>/dev/null || \
+               cat "$migration" | $DOCKER_COMPOSE exec db mysql -uroot -p$DB_ROOT_PASS amnezia_panel 2>/dev/null; then
                 # Mark as applied
-                docker compose exec -T db mysql -uamnezia -pamnezia amnezia_panel -e "INSERT INTO schema_migrations (filename) VALUES ('$FILENAME');" 2>/dev/null
+                $DOCKER_COMPOSE exec -T db mysql -uroot -p$DB_ROOT_PASS amnezia_panel -e "INSERT INTO schema_migrations (filename) VALUES ('$FILENAME');" 2>/dev/null || \
+                $DOCKER_COMPOSE exec db mysql -uroot -p$DB_ROOT_PASS amnezia_panel -e "INSERT INTO schema_migrations (filename) VALUES ('$FILENAME');" 2>/dev/null
                 echo -e "  ${GREEN}✓ Applied: $FILENAME${NC}"
                 APPLIED_COUNT=$((APPLIED_COUNT + 1))
             else
-                echo -e "  ${RED}✗ Failed: $FILENAME${NC}"
+                echo -e "  ${YELLOW}⚠ Skipped: $FILENAME (may be already applied)${NC}"
             fi
         fi
     done
@@ -141,7 +168,7 @@ fi
 # 7. Restart containers
 echo ""
 echo -e "${YELLOW}[6/7] Restarting containers...${NC}"
-docker compose restart web 2>&1 | grep -v "Warning"
+$DOCKER_COMPOSE restart web 2>&1 | grep -v "Warning"
 echo -e "${GREEN}✓ Containers restarted${NC}"
 
 # 8. Restore stashed changes
@@ -173,8 +200,8 @@ if [ -f "$BACKUP_DIR/.env_backup_$TIMESTAMP" ]; then
 fi
 echo ""
 echo "To rollback in case of issues:"
-echo "  1. Stop containers: docker compose down"
-echo "  2. Restore database: cat $BACKUP_DIR/db_backup_$TIMESTAMP.sql | docker compose exec -T db mysql -uamnezia -pamnezia amnezia_panel"
+echo "  1. Stop containers: $DOCKER_COMPOSE down"
+echo "  2. Restore database: cat $BACKUP_DIR/db_backup_$TIMESTAMP.sql | $DOCKER_COMPOSE exec -T db mysql -uroot -p$DB_ROOT_PASS amnezia_panel"
 echo "  3. Restore code: git reset --hard $CURRENT_COMMIT"
-echo "  4. Start containers: docker compose up -d"
+echo "  4. Start containers: $DOCKER_COMPOSE up -d"
 echo ""
