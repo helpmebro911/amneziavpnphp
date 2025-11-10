@@ -612,8 +612,19 @@ fi
 log ""
 log "${BLUE}[9/10] Restarting containers...${NC}"
 
+# Check if cron is configured in container
+log_info "Checking cron configuration..."
+CRON_CONFIGURED=$($DOCKER_COMPOSE exec -T web test -f /etc/cron.d/amnezia-cron && echo "1" || echo "0")
+
+if [ "$CRON_CONFIGURED" = "0" ]; then
+    log_warning "Cron not configured in container, rebuilding required..."
+    DOCKERFILE_CHANGED=1
+else
+    log_success "Cron is configured"
+    DOCKERFILE_CHANGED=0
+fi
+
 # Check if Dockerfile was modified
-DOCKERFILE_CHANGED=0
 if [ "$CURRENT_COMMIT" != "$NEW_COMMIT" ]; then
     if git diff --name-only "$CURRENT_COMMIT" "$NEW_COMMIT" 2>/dev/null | grep -q "Dockerfile\|bin/monitor_metrics.sh\|bin/collect_metrics.php"; then
         DOCKERFILE_CHANGED=1
